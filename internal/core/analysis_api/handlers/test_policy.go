@@ -48,54 +48,32 @@ func TestPolicy(request *events.APIGatewayProxyRequest) *events.APIGatewayProxyR
 		return badRequest(err)
 	}
 
-	// Build the list of resources to run the policy against
-	resources := make([]enginemodels.Resource, len(input.Tests))
-	for i, test := range input.Tests {
-		// Unmarshal resource into object form
-		var attrs map[string]interface{}
-		if err := jsoniter.UnmarshalFromString(string(test.Resource), &attrs); err != nil {
-			return badRequest(fmt.Errorf("tests[%d].resource is not valid json: %s", i, err))
-		}
-
-		resources[i] = enginemodels.Resource{
-			Attributes: attrs,
-			ID:         testResourceID + strconv.Itoa(i),
-			Type:       string(test.ResourceType),
-		}
-	}
-
+	var results *enginemodels.PolicyEngineOutput
 	// Build the policy engine request
-	testRequest := enginemodels.PolicyEngineInput{
-		Policies: []enginemodels.Policy{
-			{
-				Body: string(input.Body),
-				// Doesn't matter as we're only running one policy
-				ID:            testPolicyID,
-				ResourceTypes: input.ResourceTypes,
-			},
-		},
-		Resources: resources,
-	}
-
-	// Send the request to the policy-engine
-	var policyEngineResults enginemodels.PolicyEngineOutput
-	client := lambda.New(awsSession)
-	payload, err := jsoniter.Marshal(&testRequest)
-	if err != nil {
-		zap.L().Error("failed to marshal PolicyEngineInput", zap.Error(err))
-		return &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
-	}
-	response, err := client.Invoke(&lambda.InvokeInput{FunctionName: &env.Engine, Payload: payload})
-
-	// Handle invocation failures and lambda errors
-	if err != nil || response.FunctionError != nil {
-		zap.L().Error("error while invoking policy-engine lambda", zap.Error(err))
-		return &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
-	}
-
-	if err := jsoniter.Unmarshal(response.Payload, &policyEngineResults); err != nil {
-		zap.L().Error("failed to unmarshal lambda response into PolicyEngineOutput", zap.Error(err))
-		return &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	if input.AnalysisType == "RULE" {
+		ruleResults, response := getRuleResults(input)
+		if response != nil {
+			return response
+		}
+		results = &enginemodels.PolicyEngineOutput{
+			Resources: []enginemodels.Result{},
+		}
+		for _, event := range ruleResults.Events {
+			results.Resources = append(results.Resources, enginemodels.Result{
+				ID:      event.ID,
+				Errored: event.Errored,
+				// Note: These are flipped from what would be expected due to the fact that a
+				// 'True' return and a 'False' return have different meanings for polices vs. rules
+				Failed: event.NotMatched,
+				Passed: event.Matched,
+			})
+		}
+	} else {
+		var response *events.APIGatewayProxyResponse
+		results, response = getPolicyResults(input)
+		if response != nil {
+			return response
+		}
 	}
 
 	// Determine the results of the tests
@@ -106,7 +84,8 @@ func TestPolicy(request *events.APIGatewayProxyRequest) *events.APIGatewayProxyR
 		TestsFailed:  models.TestsFailed{},
 		TestsPassed:  models.TestsPassed{},
 	}
-	for _, result := range policyEngineResults.Resources {
+
+	for _, result := range results.Resources {
 		// Determine which test case this result corresponds to. We constructed resourceID with the
 		// format Panther:Test:Resource:TestNumber
 		testIndex, err := strconv.Atoi(strings.Split(result.ID, ":")[3])
@@ -148,6 +127,114 @@ func TestPolicy(request *events.APIGatewayProxyRequest) *events.APIGatewayProxyR
 
 	// Return the number of passing, failing, and error-ing tests
 	return gatewayapi.MarshalResponse(&testResults, http.StatusOK)
+}
+
+//nolint:dupl
+func getRuleResults(input *models.TestPolicy) (*enginemodels.RulesEngineOutput, *events.APIGatewayProxyResponse) {
+	// Build the list of events to run the rule against
+	inputEvents := make([]enginemodels.Event, len(input.Tests))
+	for i, test := range input.Tests {
+		// Unmarshal event into object form
+		var attrs map[string]interface{}
+		if err := jsoniter.UnmarshalFromString(string(test.Resource), &attrs); err != nil {
+			return nil, badRequest(fmt.Errorf("tests[%d].event is not valid json: %s", i, err))
+		}
+
+		inputEvents[i] = enginemodels.Event{
+			Data: attrs,
+			ID:   testResourceID + strconv.Itoa(i),
+			Type: string(test.ResourceType),
+		}
+	}
+
+	testRequest := enginemodels.RulesEngineInput{
+		Rules: []enginemodels.Rule{
+			{
+				Body: string(input.Body),
+				// Doesn't matter as we're only running one rule
+				ID:       testPolicyID,
+				LogTypes: input.ResourceTypes,
+			},
+		},
+		Events: inputEvents,
+	}
+
+	// Send the request to the rule-engine
+	var rulesEngineResults *enginemodels.RulesEngineOutput
+	client := lambda.New(awsSession)
+	payload, err := jsoniter.Marshal(&testRequest)
+	if err != nil {
+		zap.L().Error("failed to marshal RuleEngineInput", zap.Error(err))
+		return nil, &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	}
+	response, err := client.Invoke(&lambda.InvokeInput{FunctionName: &env.RulesEngine, Payload: payload})
+
+	// Handle invocation failures and lambda errors
+	if err != nil || response.FunctionError != nil {
+		zap.L().Error("error while invoking rules-engine lambda", zap.Error(err))
+		return nil, &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	}
+
+	if err := jsoniter.Unmarshal(response.Payload, &rulesEngineResults); err != nil {
+		zap.L().Error("failed to unmarshal lambda response into RuleEngineOutput", zap.Error(err))
+		return nil, &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	}
+
+	return rulesEngineResults, nil
+}
+
+//nolint:dupl
+func getPolicyResults(input *models.TestPolicy) (*enginemodels.PolicyEngineOutput, *events.APIGatewayProxyResponse) {
+	// Build the list of resources to run the policy against
+	resources := make([]enginemodels.Resource, len(input.Tests))
+	for i, test := range input.Tests {
+		// Unmarshal resource into object form
+		var attrs map[string]interface{}
+		if err := jsoniter.UnmarshalFromString(string(test.Resource), &attrs); err != nil {
+			return nil, badRequest(fmt.Errorf("tests[%d].resource is not valid json: %s", i, err))
+		}
+
+		resources[i] = enginemodels.Resource{
+			Attributes: attrs,
+			ID:         testResourceID + strconv.Itoa(i),
+			Type:       string(test.ResourceType),
+		}
+	}
+
+	testRequest := enginemodels.PolicyEngineInput{
+		Policies: []enginemodels.Policy{
+			{
+				Body: string(input.Body),
+				// Doesn't matter as we're only running one policy
+				ID:            testPolicyID,
+				ResourceTypes: input.ResourceTypes,
+			},
+		},
+		Resources: resources,
+	}
+
+	// Send the request to the policy-engine
+	var policyEngineResults *enginemodels.PolicyEngineOutput
+	client := lambda.New(awsSession)
+	payload, err := jsoniter.Marshal(&testRequest)
+	if err != nil {
+		zap.L().Error("failed to marshal PolicyEngineInput", zap.Error(err))
+		return nil, &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	}
+	response, err := client.Invoke(&lambda.InvokeInput{FunctionName: &env.PolicyEngine, Payload: payload})
+
+	// Handle invocation failures and lambda errors
+	if err != nil || response.FunctionError != nil {
+		zap.L().Error("error while invoking policy-engine lambda", zap.Error(err))
+		return nil, &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	}
+
+	if err := jsoniter.Unmarshal(response.Payload, &policyEngineResults); err != nil {
+		zap.L().Error("failed to unmarshal lambda response into PolicyEngineOutput", zap.Error(err))
+		return nil, &events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError}
+	}
+
+	return policyEngineResults, nil
 }
 
 func parseTestPolicy(request *events.APIGatewayProxyRequest) (*models.TestPolicy, error) {
