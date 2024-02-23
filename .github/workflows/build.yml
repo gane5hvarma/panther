@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  backend:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.13.5' # will fix later, this was from original repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.7.4" # will fix later, this was from original repo
+
+      - name: Setup Mage
+        uses: magefile/mage-action@v3
+        with:
+          install-only: true
+
+      - name: Setup project dependencies
+        run: mage -v setup
+
+      - name: Lint and test the backend infrastructure
+        run: mage test:ci
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '12.14.0' # will fix later, this was from original repo
+
+      - name: Install JS dependencies
+        run: npm install
+
+      - name: Lint project and run TS checks
+        run: npm run lint
+
+      # comment out since underlying code is 5 years old
+      # - name: Validate the project dependencies do not have any known vulnerabilities
+      #  run: npm audit
